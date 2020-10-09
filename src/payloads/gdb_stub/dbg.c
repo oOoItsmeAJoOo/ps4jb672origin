@@ -2,11 +2,16 @@
 #define _BSD_SOURCE
 extern int errno;
 #define errno not_errno
+#define pthread_t not_pthread_t
+#include <sys/thr.h>
 #else
 #define _GNU_SOURCE
+#include <pthread.h>
 #endif
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ucontext.h>
@@ -17,6 +22,7 @@ extern int errno;
 
 #ifdef __PS4__
 #undef errno
+#undef pthread_t
 #define PAGE_SIZE 16384ull
 #else
 #define PAGE_SIZE 4096ull
@@ -135,6 +141,14 @@ static const char* commands[] = {
     "g",
     "m",
     "qAttached",
+#ifdef __PS4__
+    "qOffsets",
+#endif
+    "qSupported:",
+#ifdef __PS4__
+    "qXfer:exec-file:read:",
+#endif
+    "qXfer:features:read:target.xml:",
     "s",
 };
 
@@ -147,6 +161,19 @@ static void reloc_commands()
     for(int i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
         commands[i] += diff;
 }
+
+#ifdef BLOB
+extern char _end[];
+
+static void mprotect_rwx()
+{
+    unsigned long long start = (unsigned long long)_start;
+    unsigned long long end = (unsigned long long)_end;
+    start &= ~(PAGE_SIZE-1);
+    end = ((end - 1) | (PAGE_SIZE-1)) + 1;
+    mprotect((void*)start, end-start, PROT_READ|PROT_WRITE|PROT_EXEC);
+}
+#endif
 #endif
 
 enum
@@ -163,6 +190,14 @@ enum
     CMD_G_READ,
     CMD_M_READ,
     CMD_Q_ATTACHED,
+#ifdef __PS4__
+    CMD_Q_OFFSETS,
+#endif
+    CMD_Q_SUPPORTED,
+#ifdef __PS4__
+    CMD_QXFER_EXEC_FILE,
+#endif
+    CMD_QXFER_TARGET_XML,
     CMD_S,
 };
 
@@ -291,6 +326,28 @@ static int write_mem(const unsigned char* buf, unsigned long long addr, int sz)
 
 static int was_last_step;
 
+void serve_string(pkt_opaque o, char* s, unsigned long long l, int has_annex)
+{
+    unsigned long long annex, start, len;
+    if(has_annex)
+        read_hex(o, &annex);
+    read_hex(o, &start);
+    read_hex(o, &len);
+    if(start > l)
+        start = l;
+    if(len > l || start + len > l)
+        len = l - start;
+    start_packet(o);
+    if(len == 0)
+        pkt_puts(o, "l", 1);
+    else
+    {
+        pkt_puts(o, "m", 1);
+        pkt_puts(o, s+start, len);
+    }
+    end_packet(o);
+}
+
 static void main_loop(struct trap_state* ts)
 {
     pkt_opaque o;
@@ -415,9 +472,37 @@ static void main_loop(struct trap_state* ts)
         case CMD_Q_ATTACHED:
             skip_to_end(o);
             start_packet(o);
-            pkt_puts(o, "1", 1);
+            pkt_puts(o, "0", 1);
             end_packet(o);
             break;
+#ifdef __PS4__
+#ifndef BLOB // TODO: implement (how?)
+        case CMD_QXFER_EXEC_FILE:
+            serve_string(o, "payload.elf", 11, 1);
+            break;
+#endif
+        case CMD_Q_OFFSETS:
+        {
+            skip_to_end(o);
+            start_packet(o);
+            unsigned long long base_addr = ((unsigned long long)_start);
+#ifdef BLOB
+            base_addr &= ~(PAGE_SIZE-1);
+            char probe;
+            while(!read_mem(&probe, base_addr, 1))
+                base_addr -= PAGE_SIZE;
+            base_addr += PAGE_SIZE;
+#else
+            base_addr -= 4096;
+#endif
+            char buf[24] = "TextSeg=";
+            for(int i = 15; i >= 0; i--)
+                buf[23-i] = int2hex((base_addr >> (4*i)) & 15);
+            pkt_puts(o, buf, 24);
+            end_packet(o);
+            break;
+        }
+#endif
         default:
             skip_to_end(o);
         case CMD_EOL:
@@ -428,8 +513,70 @@ static void main_loop(struct trap_state* ts)
     }
 }
 
+#ifdef INTERRUPTER_THREAD
+int in_signal_handler = 0;
+
+#ifdef __PS4__
+// mock code, to make main code cleaner
+// not "real" pthreads
+
+typedef long pthread_t;
+
+void pthread_create(long* p_tid, void* _2, void* f, void* arg)
+{
+    //printf("pthread_create stub called\n");
+    long x, y;
+    static char* stack;
+    if(!stack)
+        stack = mmap(NULL, 65536, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    struct thr_param param = {
+        .start_func = (void(*)(void*))f,
+        .arg = arg,
+        .stack_base = stack,
+        .stack_size = 65536,
+        .tls_base = NULL, // never used
+        .tls_size = 0,
+        .child_tid = &x,
+        .parent_tid = p_tid,
+        .flags = 0,
+        .rtp = NULL,
+    };
+    thr_new(&param, sizeof(param));
+}
+
+long pthread_self()
+{
+    long ans = 0;
+    thr_self(&ans);
+    return ans;
+}
+
+#define pthread_kill thr_kill
+#define pthread_detach(...)
+#endif
+
+void* interrupter_thread(void* o)
+{
+    pthread_t parent = (pthread_t)o;
+    fd_set a, b;
+    FD_ZERO(&a);
+    FD_ZERO(&b);
+    FD_SET(gdb_socket, &a);
+    while(select(gdb_socket+1, &a, &b, &b, NULL) <= 0);
+    if(!in_signal_handler)
+        pthread_kill(parent, SIGINT);
+#ifdef __PS4__
+    thr_exit(0);
+#endif
+}
+
+#endif
+
 static void signal_handler(int signum, siginfo_t* idc, void* o_uc)
 {
+#ifdef INTERRUPTER_THREAD
+    in_signal_handler = 1;
+#endif
     ucontext_t* uc = (ucontext_t*)o_uc;
 #ifdef __PS4__
     mcontext_t* mc = (mcontext_t*)(((char*)&uc->uc_mcontext)+48); // wtf??
@@ -491,7 +638,7 @@ static void signal_handler(int signum, siginfo_t* idc, void* o_uc)
             .ds = 0xdeadbeef,
             .es = 0xdeadbeef,
             .ss = 0xdeadbeef,
-            .fs = uc->uc_mcontext.gregs[REG_CSGSFS] >> 32 & 0xffff
+            .fs = uc->uc_mcontext.gregs[REG_CSGSFS] >> 32 & 0xffff,
             .gs = uc->uc_mcontext.gregs[REG_CSGSFS] >> 16 & 0xffff,
 #endif
         }
@@ -536,6 +683,12 @@ static void signal_handler(int signum, siginfo_t* idc, void* o_uc)
     uc->uc_mcontext.gregs[REG_RIP] = ts.regs.rip;
     uc->uc_mcontext.gregs[REG_EFL] = ts.regs.eflags;
 #endif
+#ifdef INTERRUPTER_THREAD
+    in_signal_handler = 0;
+    pthread_t child;
+    pthread_create(&child, NULL, interrupter_thread, (void*)pthread_self());
+    pthread_detach(child);
+#endif
 }
 
 static unsigned long long start_rip;
@@ -560,6 +713,9 @@ static void tmp_sigsegv(int sig, siginfo_t* idc, void* o_uc)
 void dbg_enter(void)
 {
 #ifdef __PS4__
+#ifdef BLOB
+    mprotect_rwx();
+#endif
     reloc_commands();
 #endif
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -574,6 +730,8 @@ void dbg_enter(void)
         return;
     listen(sock, 1);
     gdb_socket = accept(sock, NULL, NULL);
+    int nodelay = 1;
+    setsockopt(gdb_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     int p[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, p);
     pipe_r = p[0];
@@ -588,6 +746,8 @@ void dbg_enter(void)
     sigaction(SIGTRAP, &siga, NULL);
     sigaction(SIGILL, &siga, NULL);
     sigaction(SIGBUS, &siga, NULL);
+    sigaction(SIGINT, &siga, NULL);
+    sigaction(SIGSYS, &siga, NULL);
     siga.sa_sigaction = tmp_sigsegv;
     sigaction(SIGSEGV, &siga, NULL);
     pkt_opaque o;
@@ -599,6 +759,21 @@ void dbg_enter(void)
         case CMD_Q:
             skip_to_end(o);
             goto exit;
+        case CMD_Q_SUPPORTED:
+            skip_to_end(o);
+            start_packet(o);
+            pkt_puts(o, "qXfer:features:read+"
+#ifdef __PS4__
+#ifndef BLOB
+            ";qXfer:exec-file:read+"
+#endif
+#endif
+            , 42);
+            end_packet(o);
+            break;
+        case CMD_QXFER_TARGET_XML:
+            serve_string(o, "<?xml version=\"1.0\"?>\n<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n<target>\n<architecture>i386:x86-64</architecture>\n<osabi>GNU/Linux</osabi>\n</target>\n", 149, 0);
+            break;
         default:
             skip_to_end(o);
         case CMD_EOL:
